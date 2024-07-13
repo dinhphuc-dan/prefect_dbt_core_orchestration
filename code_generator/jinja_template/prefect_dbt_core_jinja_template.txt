@@ -1,0 +1,199 @@
+
+from prefect import flow, get_run_logger
+from prefect.runner.storage import GitRepository
+from prefect_dbt.cli import DbtCoreOperation
+from prefect.blocks.notifications import SlackWebhook
+from pathlib import Path
+import argparse
+from prefect.deployments import Deployment
+from prefect.blocks.system import Secret
+from prefect.filesystems import GitHub
+from prefect.blocks.system import Secret
+from prefect.exceptions import PrefectException
+import asyncio
+import logging
+import os
+import time
+from datetime import timedelta
+import requests
+
+
+# create a custom logger instead of using prefect logger
+custom_logger = logging.getLogger('custom')
+custom_logger.addHandler(logging.StreamHandler())
+custom_logger.setLevel(logging.INFO)
+custom_logger.propagate = False
+
+# basic setup for argument throug command line for local testing and development
+_parser=argparse.ArgumentParser()
+_parser.add_argument("--deploy")
+_parser.add_argument("--command")
+_args=_parser.parse_args()
+
+# step 1: load repo information from prefect, below infomation is immutable. DONT CHANGE
+
+_prefect_agent_dbt_github = GitHub.load("{{prefect_agent_dbt_github_name}}")
+_original_dbt_core_object =DbtCoreOperation.load("{{dbt_core_object_name_in_prefect}}")
+_access_token_to_dbt_repo= Secret.load("voliovn-group-data-admin-github-access-token")
+_current_dir = Path.cwd()
+discord_webhook_link = ' https://discord.com/api/webhooks/1257918204592918579/wjnyRt7hDBoiJaBoK-yP-JXL7he2sLH-KxRdYZII9rlKzoUtVT-ton1Fd3Uz8J0B9BIh'
+
+class Repo():
+    def __init__(self, dbt_object, access_token_to_dbt_repo, logger) -> None:
+        self.dbt_object = dbt_object
+        self.access_token_to_dbt_repo = access_token_to_dbt_repo
+        self.repo_link = self._check_repo_link()
+        self.repo_name = self._check_repo_name()
+        self.slack_channel = self._check_slack_channel()
+        self.repo_branch = self.dbt_object.env.get('repo_branch', 'main')
+        self.dbt_command = self.dbt_object.commands
+        self.location_for_pulling_repo = '.repo/' + self.repo_name
+        # alter profile and project directory of dbt_object
+        self.dbt_object.profiles_dir = Path(_current_dir) / '.repo' / self.repo_name
+        self.dbt_object.project_dir = Path(_current_dir) / '.repo' / self.repo_name
+        # add prefect logger
+        self.logger = logger
+
+    def _check_repo_link(self):
+        if not self.dbt_object.env.get('repo_link', None):
+            raise ImportError(
+                'There is no config of repo link! '
+                'Please insert this value in Prefect dbt Core Operation block at Environment Variables Section'
+            )
+        else:
+            return self.dbt_object.env['repo_link']
+
+    def _check_repo_name(self):
+        if not self.dbt_object.env.get('repo_name', None):
+            raise ImportError(
+                'There is no config of repo name! '
+                'Please insert this value in Prefect dbt Core Operation block at Environment Variables Section'
+            )
+        else:
+            return self.dbt_object.env['repo_name']
+    
+    def _check_slack_channel(self):
+        if not self.dbt_object.env.get('slack_channel', None):
+            raise ImportError(
+                'There is no config of repo name! '
+                'Please insert this value in Prefect dbt Core Operation block at Environment Variables Section'
+            )
+        else:
+            return self.dbt_object.env['slack_channel']
+
+    async def _pull_git_repo(self):
+        # clone or pull dbt repo to the dir repo/{dbt-core-repo-name}. Ex: repo/test_dbt_core
+        dbt_repo = GitRepository(
+            url=self.repo_link,
+            branch=self.repo_branch,
+            credentials={
+                "access_token": self.access_token_to_dbt_repo
+            },
+            name=self.location_for_pulling_repo)
+        
+        # due to pull_code() fuction is an async function, we need to use await
+        await dbt_repo.pull_code()
+    
+    async def _prepare_for_calling_dbt_command(self):
+        # pull git repo and wait it to complete
+        await self._pull_git_repo()
+        self.logger.info(f"Pull git repo successfully!")
+
+        # check dbt object congfig by using dbt debug command
+        self.dbt_object.commands = ["dbt debug"]
+        self.logger.info(f"Running DBT Debug!")
+        self.dbt_object.run()
+        self.logger.info(f"DBT Debug without any error!")
+
+    def slack_noti(self,text_input):
+        slack_webhook_block = SlackWebhook.load(self.slack_channel)
+        slack_webhook_block.notify(f"{text_input}")
+    
+    async def execute_dbt_command(self):
+        # due to _prepare_for_calling_dbt_command fuction is an async function, we need to use await
+        await self._prepare_for_calling_dbt_command()
+
+         # then add dbt deps along with dbt command
+        self.dbt_command.insert(0, 'dbt deps')
+        self.dbt_object.commands = self.dbt_command
+        self.logger.info(f"Add dbt deps, prepare to run {self.dbt_command}!")
+
+        # even through trigger(), wait_for_completion(), fetch_result() is an async function but
+        # when we use them with await, it returns TypeError: object XX can't be used in 'await' expression"
+        # so we remove await and it works normally
+        # when we dont put trigger, wait_for_completion and fetch_result under an async fuction 
+        # then they return Error as described in https://github.com/PrefectHQ/prefect/issues/6335
+        
+        run_command = self.dbt_object.trigger()
+        run_command.wait_for_completion()
+        run_result = run_command.fetch_result()
+        return run_result
+    
+        
+
+''' create new dbt object from DbtCoreOperation object, each new dbt object contain only one dbt command '''
+{%- for k,v in commands_of_dbt_core_object_in_prefect_as_dict.items() %}
+
+def generate_dbt_object_{{k}}():
+    dbt_object_{{k}} = _original_dbt_core_object
+    dbt_object_{{k}}.commands = ["{{v}}"]
+    return dbt_object_{{k}}
+
+@flow
+def dbt_command_{{v | replace(" ", "_") | replace("-","_") | replace(".", "_") | replace("/", "_") | replace("+","_")}}():
+    # due to _access_token_to_dbt_repo is an Secret Class - Secret(value=SecretStr('**********'))
+    # we need to use get() to get access token as string
+    os.environ["DBT_ENV_SECRET_GIT_CREDENTIAL"] = _access_token_to_dbt_repo.get()
+    dbt_object_{{k}} = generate_dbt_object_{{k}}()
+    dbt = Repo(
+        dbt_object=dbt_object_{{k}},
+        access_token_to_dbt_repo=_access_token_to_dbt_repo,
+        logger=get_run_logger()
+        )
+    try:
+        # due to _execute_dbt_command fuction is an async function, we need to use asyncio.run
+        start_run = time.time()
+        asyncio.run(dbt.execute_dbt_command())
+        end_run = time.time()
+        run_time = round((end_run - start_run),2)
+        dbt.slack_noti(f'*DBT* :green_heart: :green_heart: :green_heart: :green_heart: :green_heart: :green_heart: \n Run *Succeeded* on *{dbt.repo_name}* with command *{dbt.dbt_command}* :smile: \n *Duration* {run_time} second ')
+        if 'pion' not in dbt.repo_name:
+            requests.request(method = 'POST', url=discord_webhook_link, json = {"username": "Data-bot", "content" :f"Push data to Superset COMPLETED on **{dbt.repo_name} with command {dbt.dbt_command}**"})
+    except Exception as e:
+        end_run = time.time()
+        run_time = round((end_run - start_run),2)
+        dbt.slack_noti(f'*DBT* :no_entry: :no_entry: :no_entry: :no_entry: :no_entry: :no_entry: \n Run *FAILED* on *{dbt.repo_name}* with command *{dbt.dbt_command}* :upside_down_face: \n *Duration* {run_time} second  \n *Error as:* \n {repr(e)}')
+        if 'pion' not in dbt.repo_name:
+            requests.request(method = 'POST', url=discord_webhook_link, json = {"username": "Data-bot", "content":f"Push data to Superset FAILED on **{dbt.repo_name} with command {dbt.dbt_command}**"})
+        raise PrefectException(f'{repr(e)}')
+
+def deploy_to_prefect_by_tag_dbt_object_{{k}}():
+    Deployment.build_from_flow(
+        flow=dbt_command_{{v | replace(" ", "_") | replace("-","_") | replace(".", "_") | replace("/", "_") | replace("+","_")}},
+        name="{{prefect_deployement_name}}",
+        apply=True,
+        work_queue_name="COMPANY_PC_DBT",
+        storage=_prefect_agent_dbt_github
+    )
+    custom_logger.info(f"Deploy dbt_command_{{v | replace(" ", "_") | replace("-","_") | replace(".", "_") | replace("/", "_") | replace("+","_")}} flow successfully! Please check in Prefect Cloud UI")
+
+{% endfor -%}
+
+# if __name__ == "__main__" to avoid running code when import at other module
+# below code is for local development
+if __name__ == "__main__":
+    if {%- for k,v in commands_of_dbt_core_object_in_prefect_as_dict.items() %} _args.command != "{{v}}"
+    {%- if not loop.last %} and {%- endif %}
+    {%- if loop.last %} : {%- endif %}
+    {%- endfor %}
+        custom_logger.info(f"Your command is not Valid! Please try again")
+    else: 
+        {%- for k,v in commands_of_dbt_core_object_in_prefect_as_dict.items() %}
+        # when use tag --deloy true 
+        # and tag --command "your_dbt_command" in command line,
+        # then it will deploy the flow into prefect cloud UI
+        if _args.deploy == 'true' and _args.command == "{{v}}":
+            deploy_to_prefect_by_tag_dbt_object_{{k}}()
+        elif _args.command == "{{v}}":
+            dbt_command_{{v | replace(" ", "_") | replace("-","_") | replace(".", "_") | replace("/", "_") | replace("+","_")}}()
+        {% endfor -%}

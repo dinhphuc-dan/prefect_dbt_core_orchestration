@@ -1,0 +1,5 @@
+# python 3.10.0
+
+prefect==2.14.17
+prefect-dbt[bigquery]==0.4.1
+python-dotenv==1.0.1
